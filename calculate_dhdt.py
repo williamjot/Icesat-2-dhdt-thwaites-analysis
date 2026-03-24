@@ -1,7 +1,7 @@
 """
 calculate_dhdt.py
 =================
-Cálculo de dh/dt por tile — ajuste espaço-temporal (fitsec).
+Cálculo de dh/dt por tile — ajuste espaço-temporal.
 
 Modelo:
   h(x,y,t) = p0 + p1·Δt + p2·½Δt²
