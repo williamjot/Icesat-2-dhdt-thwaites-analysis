@@ -3,16 +3,10 @@ create_tiles.py
 Divide atl06_masked.h5 em tiles espaciais no sistema EPSG:3031 (metros).
 
 BBOX da região: lon (-106.5, -103.5)  lat (-75.5, -74.5)
-Área estimada : ~90 km × ~110 km  ≈ ~10 000 km²
-
-Tamanho do tile: 50 km × 50 km  → grade 2×3 = ~6 tiles possíveis
-  (ajuste TILE_KM se quiser mais ou menos subdivisão)
-
 Cada tile salvo como tile_XXXX_YYYY.h5 com variáveis:
   x, y  (EPSG:3031, metros)
   lon, lat, h_elv, s_elv, t_year, beam, spot, orb
 
-Leitura 100% sequencial via memmap — sem fancy-indexing.
 """
 
 import numpy as np
