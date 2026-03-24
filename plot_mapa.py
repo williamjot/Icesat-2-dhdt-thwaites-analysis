@@ -1,12 +1,8 @@
 """
 05_plot_polar_map.py
 ====================
-Mapa polar profissional de dh/dt — estilo Smith et al. 2020 / NSIDC.
+Mapa polar de dh/dt
 
-Correções v2:
-  - Paleta RdBu (divergente, padrão científico)
-  - Interpolação linear (scipy.griddata) → elimina efeito escada/pixelado
-  - Gaussian smoothing adaptativo pós-interpolação
 """
 
 import sys
