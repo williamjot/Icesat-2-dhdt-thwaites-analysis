@@ -2,9 +2,8 @@
 apply_mask.py  v2
 Aplica máscara BedMachine Antarctica (.tif) ao arquivo merged.
 
-Funciona com o .tif da ANTÁRTICA INTEIRA — lê apenas a janela
-correspondente à sua bbox (windowed reading), sem carregar o
-raster completo na RAM.
+Funciona com o .tif de toda a antártica, lê apenas a janela
+correspondente à sua bbox
 
 Remove oceano (mask == 0), mantém gelo (1, 2), rocha (3), lago (4).
 """
