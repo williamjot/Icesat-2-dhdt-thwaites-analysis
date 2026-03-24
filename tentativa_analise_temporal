@@ -1,1 +1,741 @@
+"
+========================
+Análise temporal de elevação do gelo por RGT — ICESat-2 ATL06
+Região: Amundsen Sea Embayment / Thwaites  (2019–2025)
 
+Metodologia:
+  - Lê arquivos ATL06 (.h5) da NASA
+  - Filtra pela bbox de Thwaites
+  - Agrupa medições pelo mesmo RGT + beam + bin ao longo da trilha
+  - Em cada bin: ajusta h(t) = p0 + p1·Δt + p2·½Δt²
+  - Interpola ciclos faltantes via vizinhos temporais
+  - Gera gráficos da série temporal por ponto
+
+Saídas:
+  - figures/timeseries/  → gráficos .png por bin
+  - results/rgt_timeseries.h5 → resultados numéricos
+"""
+
+import numpy as np
+import h5py
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import TwoSlopeNorm
+from pathlib import Path
+from pyproj import Transformer
+from scipy import linalg
+from scipy.interpolate import interp1d
+import warnings
+import gc
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CAMINHOS — ajuste para sua máquina
+# ============================================================
+BASE_DIR   = Path(r"D:\WILLIAM\PIBIC_MARCO\thwaites_winter")
+ATL06_DIR  = BASE_DIR / "atl06"          # pasta com os .h5 da NASA
+OUT_DIR    = BASE_DIR / "rgt_analysis"
+FIG_DIR    = OUT_DIR  / "figures" / "timeseries"
+RES_DIR    = OUT_DIR  / "results"
+
+for d in [FIG_DIR, RES_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# PARÂMETROS
+# ============================================================
+
+# Bounding box de Thwaites (graus decimais)
+LON_MIN, LON_MAX = -106.5, -103.5
+LAT_MIN, LAT_MAX = -75.5,  -74.5
+
+# Ano de referência (centro do período)
+T_REF = 2022.5
+
+# Tamanho do bin ao longo da trilha (metros)
+# 500 m → resolução compatível com ATL06 (segmentos de ~20 m agrupados)
+BIN_SIZE = 500.0
+
+# Raio de busca dentro do bin para agrupar medições (metros)
+# Um bin de 500 m pode ter pequenos desvios laterais entre ciclos
+BIN_HALF = BIN_SIZE / 2.0
+
+# Mínimo de ciclos válidos para ajustar a série
+MIN_CYCLES = 6
+
+# Span temporal mínimo (anos)
+DT_MIN = 2.0
+
+# Limiar de rejeição de outliers (n-sigma)
+N_SIGMA = 3.0
+
+# Limite físico de dh/dt para Thwaites
+RATE_LIM = 8.0   # m/ano
+
+# Limite de aceleração
+P2_LIM = 1.0     # m/ano²
+
+# Máximo de figuras a gerar por RGT (None = todos)
+# Coloque um número pequeno (ex: 10) para testar rapidamente
+MAX_FIGS_PER_RGT = 10
+
+# Beams ATL06 a processar (gt1l, gt1r, gt2l, gt2r, gt3l, gt3r)
+BEAMS = ["gt1l", "gt1r", "gt2l", "gt2r", "gt3l", "gt3r"]
+
+# ============================================================
+# PROJEÇÃO
+# ============================================================
+to_stereo = Transformer.from_crs("EPSG:4326", "EPSG:3031", always_xy=True)
+to_lonlat = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
+
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
+def mad_std(r):
+    """Desvio padrão robusto via MAD."""
+    med = np.nanmedian(r)
+    return 1.4826 * np.nanmedian(np.abs(r - med))
+
+
+def decimal_year(delta_time, atlas_epoch=2018.0):
+    """
+    Converte delta_time do ATL06 (segundos desde 2018-01-01) em ano decimal.
+    atlas_epoch = 2018.0 (padrão ICESat-2)
+    """
+    return atlas_epoch + delta_time / (365.25 * 86400.0)
+
+
+def read_atl06_beam(filepath, beam):
+    """
+    Lê um beam de um arquivo ATL06.
+    Retorna dict com arrays: lat, lon, h, t, s, rgt, cycle
+    ou None se o beam não existir ou estiver vazio.
+    """
+    try:
+        with h5py.File(filepath, "r") as f:
+            if beam not in f:
+                return None
+
+            grp = f[beam]["land_ice_segments"]
+
+            lat  = grp["latitude"][:]
+            lon  = grp["longitude"][:]
+            h    = grp["h_li"][:]           # elevação (m)
+            s    = grp["h_li_sigma"][:]     # incerteza formal (m)
+            dt   = grp["delta_time"][:]     # segundos desde epoch
+            atl  = f["ancillary_data"]["atlas_sdp_gps_epoch"][0]
+            # epoch em ano decimal (GPS → UTC offset pequeno, ignorado aqui)
+            epoch_yr = 1980.0 + atl / (365.25 * 86400.0)
+            t    = decimal_year(dt, atlas_epoch=epoch_yr)
+
+            # RGT e ciclo ficam nos metadados do arquivo
+            rgt_val   = int(f["orbit_info"]["rgt"][0])
+            cycle_val = int(f["orbit_info"]["cycle_number"][0])
+
+            # Máscara de qualidade
+            atl_flag = grp["atl06_quality_summary"][:]
+            ok = (
+                (atl_flag == 0)         &
+                np.isfinite(h)          &
+                np.isfinite(lat)        &
+                (s > 0) & (s < 10.0)   &
+                (h > -100) & (h < 5000)
+            )
+
+            if ok.sum() == 0:
+                return None
+
+            return {
+                "lat":   lat[ok],
+                "lon":   lon[ok],
+                "h":     h[ok],
+                "s":     s[ok],
+                "t":     t[ok],
+                "rgt":   rgt_val,
+                "cycle": cycle_val,
+            }
+
+    except (OSError, KeyError):
+        return None
+
+
+def filter_bbox(data):
+    """Filtra pontos dentro da bbox de Thwaites."""
+    mask = (
+        (data["lon"] >= LON_MIN) & (data["lon"] <= LON_MAX) &
+        (data["lat"] >= LAT_MIN) & (data["lat"] <= LAT_MAX)
+    )
+    if mask.sum() == 0:
+        return None
+    return {k: v[mask] if isinstance(v, np.ndarray) else v
+            for k, v in data.items()}
+
+
+def project_to_stereo(data):
+    """Adiciona colunas x, y (EPSG:3031) ao dict."""
+    x, y = to_stereo.transform(data["lon"], data["lat"])
+    data["x"] = x
+    data["y"] = y
+    return data
+
+
+def along_track_distance(x, y):
+    """
+    Distância acumulada ao longo da trilha (metros).
+    Assume que os pontos já estão ordenados ao longo do perfil.
+    """
+    dx = np.diff(x)
+    dy = np.diff(y)
+    ds = np.sqrt(dx**2 + dy**2)
+    return np.concatenate([[0.0], np.cumsum(ds)])
+
+
+def bin_along_track(s_dist, bin_size):
+    """Atribui cada ponto a um bin de `bin_size` metros."""
+    return (np.floor(s_dist / bin_size) * bin_size).astype(np.float64)
+
+
+def interpolate_missing_cycles(t_obs, h_obs, t_all_cycles):
+    """
+    Interpola valores faltantes usando vizinhos temporais mais próximos.
+    t_obs      : tempos com observações
+    h_obs      : elevações observadas
+    t_all_cycles: todos os tempos esperados (um por ciclo)
+    Retorna h_interp para todos os ciclos, com NaN onde não há cobertura.
+    """
+    if len(t_obs) < 2:
+        return np.full(len(t_all_cycles), np.nan)
+
+    # Interpolação linear com extrapolação NaN fora do intervalo
+    f = interp1d(t_obs, h_obs, kind="linear",
+                 bounds_error=False, fill_value=np.nan)
+    return f(t_all_cycles)
+
+
+def fit_timeseries(t, h, s=None):
+    """
+    Ajusta h(t) = p0 + p1·Δt + p2·½Δt² com rejeição iterativa de outliers.
+    Retorna dict com p0, p1, p2, erros, rmse, nobs ou None se falhar.
+    """
+    dt = t - T_REF
+    n  = len(dt)
+    if n < MIN_CYCLES:
+        return None
+    if (t.max() - t.min()) < DT_MIN:
+        return None
+
+    A = np.column_stack([np.ones(n), dt, 0.5 * dt**2])
+    m = A.shape[1]
+
+    mask = np.ones(n, dtype=bool)
+    xhat = ehat = None
+    rmse = np.nan
+
+    for _ in range(5):
+        Af = A[mask]
+        hf = h[mask]
+        nf = mask.sum()
+        if nf < m + 2:
+            return None
+
+        if s is not None:
+            sf  = s[mask]
+            sf  = np.where(sf <= 0, np.median(sf[sf > 0]) if (sf > 0).any() else 0.05, sf)
+            wf  = 1.0 / (sf**2 + 1e-12)
+            wf /= wf.mean()
+            W   = np.sqrt(wf)
+            Aw  = Af * W[:, None]
+            hw  = hf * W
+        else:
+            Aw, hw = Af, hf
+
+        try:
+            xhat_new, _, rank, _ = linalg.lstsq(Aw, hw, check_finite=False)
+        except (linalg.LinAlgError, ValueError):
+            return None
+
+        if rank < m:
+            return None
+
+        xhat = xhat_new
+        res  = hf - Af @ xhat
+        rmse = float(np.std(res))
+
+        try:
+            sig2 = float(np.sum(res**2) / max(nf - m, 1))
+            ehat = np.sqrt(np.abs(np.diag(linalg.inv(Aw.T @ Aw))) * sig2)
+        except linalg.LinAlgError:
+            ehat = np.full(m, np.nan)
+
+        mad = mad_std(res)
+        if mad < 1e-10:
+            break
+        bad = np.abs(res) > N_SIGMA * mad
+        if not bad.any():
+            break
+        mask[np.where(mask)[0][bad]] = False
+
+    if xhat is None:
+        return None
+
+    p1 = float(xhat[1])
+    p2 = float(xhat[2])
+
+    if abs(p1) > RATE_LIM:
+        return None
+    if abs(p2) > P2_LIM:
+        p2 = np.nan
+        ehat[2] = np.nan
+
+    return {
+        "p0":     float(xhat[0]),
+        "p1":     p1,
+        "p2":     p2,
+        "p0_err": float(ehat[0]) if ehat is not None else np.nan,
+        "p1_err": float(ehat[1]) if ehat is not None else np.nan,
+        "p2_err": float(ehat[2]) if ehat is not None else np.nan,
+        "rmse":   rmse,
+        "nobs":   int(mask.sum()),
+        "mask":   mask,
+    }
+
+
+# ============================================================
+# FUNÇÃO DE PLOT — série temporal de um bin
+# ============================================================
+
+def plot_timeseries(bin_id, rgt, beam, lat0, lon0,
+                    t_obs, h_obs, t_all, h_interp,
+                    fit, out_path):
+    """
+    Gráfico completo da série temporal de um bin:
+      - Pontos observados
+      - Valores interpolados (ciclos faltantes)
+      - Curva ajustada
+      - Resíduos
+      - Metadados do ajuste
+    """
+    fig = plt.figure(figsize=(13, 8))
+    gs  = gridspec.GridSpec(3, 1, height_ratios=[3, 1.2, 0.05],
+                            hspace=0.12)
+
+    ax1 = fig.add_subplot(gs[0])
+    ax2 = fig.add_subplot(gs[1], sharex=ax1)
+
+    # ── Série temporal ──────────────────────────────────────
+    # Pontos observados (usados no ajuste)
+    mask_fit = fit["mask"]
+    t_fit = t_obs[mask_fit]
+    h_fit = h_obs[mask_fit]
+
+    # Pontos rejeitados
+    t_rej = t_obs[~mask_fit]
+    h_rej = h_obs[~mask_fit]
+
+    # Pontos interpolados (ciclos faltantes)
+    t_missing = t_all[~np.isin(t_all.round(4),
+                                t_obs.round(4))]
+    h_missing = h_interp[~np.isin(t_all.round(4),
+                                   t_obs.round(4))]
+    valid_interp = ~np.isnan(h_missing)
+
+    # Curva ajustada
+    t_curve = np.linspace(t_all.min(), t_all.max(), 300)
+    dt_c    = t_curve - T_REF
+    h_curve = (fit["p0"]
+               + fit["p1"] * dt_c
+               + (0.5 * fit["p2"] * dt_c**2
+                  if not np.isnan(fit["p2"]) else 0.0))
+
+    # Banda de incerteza (±1σ do p1 propagada)
+    h_upper = h_curve + fit["p1_err"] * np.abs(dt_c)
+    h_lower = h_curve - fit["p1_err"] * np.abs(dt_c)
+
+    ax1.fill_between(t_curve, h_lower, h_upper,
+                     alpha=0.15, color="#1565C0", label="±1σ (p1)")
+    ax1.plot(t_curve, h_curve, "-", color="#1565C0",
+             lw=2.0, label="Ajuste polinomial", zorder=5)
+
+    if valid_interp.any():
+        ax1.plot(t_missing[valid_interp], h_missing[valid_interp],
+                 "s", color="#FF9800", ms=7, alpha=0.7,
+                 label=f"Interpolado ({valid_interp.sum()} ciclos)", zorder=3)
+
+    ax1.plot(t_fit, h_fit, "o", color="#2E7D32", ms=6,
+             label=f"Observado ({len(t_fit)} ciclos)", zorder=4)
+
+    if len(t_rej) > 0:
+        ax1.plot(t_rej, h_rej, "x", color="red", ms=8,
+                 mew=2, label=f"Rejeitado ({len(t_rej)})", zorder=4)
+
+    ax1.set_ylabel("Elevação h (m)", fontsize=11)
+    ax1.legend(fontsize=9, loc="best", framealpha=0.9)
+    ax1.grid(True, alpha=0.3, linestyle="--")
+    ax1.tick_params(labelbottom=False)
+
+    # Anotação com resultados
+    p2_str = (f"{fit['p2']:+.4f} ± {fit['p2_err']:.4f} m/ano²"
+              if not np.isnan(fit["p2"]) else "n/d")
+    info = (
+        f"dh/dt  = {fit['p1']:+.4f} ± {fit['p1_err']:.4f} m/ano\n"
+        f"d²h/dt²= {p2_str}\n"
+        f"h₀     = {fit['p0']:.2f} m  (ref. {T_REF})\n"
+        f"RMSE   = {fit['rmse']:.4f} m   |   n = {fit['nobs']} ciclos"
+    )
+    ax1.text(0.02, 0.97, info, transform=ax1.transAxes,
+             fontsize=9.5, va="top", fontfamily="monospace",
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="white",
+                       edgecolor="#AAAAAA", alpha=0.92))
+
+    # ── Resíduos ─────────────────────────────────────────────
+    if len(t_fit) > 0:
+        h_pred_fit = (fit["p0"]
+                      + fit["p1"] * (t_fit - T_REF)
+                      + (0.5 * fit["p2"] * (t_fit - T_REF)**2
+                         if not np.isnan(fit["p2"]) else 0.0))
+        res = h_fit - h_pred_fit
+        ax2.bar(t_fit, res, width=0.06, color="#2E7D32",
+                alpha=0.7, label="Resíduos")
+        ax2.axhline(0, color="black", lw=1.0, ls="--")
+        ax2.axhline( fit["rmse"], color="gray", lw=0.8, ls=":")
+        ax2.axhline(-fit["rmse"], color="gray", lw=0.8, ls=":")
+        ax2.set_ylabel("Resíduo (m)", fontsize=10)
+        ax2.set_xlabel("Ano", fontsize=11)
+        ax2.grid(True, alpha=0.3, linestyle="--")
+
+    # ── Título ───────────────────────────────────────────────
+    taxa_cor = "#CC2A2A" if fit["p1"] < 0 else "#1565C0"
+    taxa_txt = f"dh/dt = {fit['p1']:+.3f} m/ano"
+    fig.suptitle(
+        f"Série Temporal ICESat-2 — RGT {rgt:04d} | {beam.upper()} | "
+        f"Bin {bin_id:.0f} m\n"
+        f"Lat {lat0:.4f}°  Lon {lon0:.4f}°  |  "
+        f"{taxa_txt}",
+        fontsize=11, fontweight="bold", color=taxa_cor
+    )
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+print("=" * 65)
+print("ANÁLISE TEMPORAL POR RGT — ICESat-2 ATL06")
+print("=" * 65)
+print(f"  Bbox     : lon [{LON_MIN}, {LON_MAX}]  lat [{LAT_MIN}, {LAT_MAX}]")
+print(f"  Período  : 2019–2025")
+print(f"  Bin size : {BIN_SIZE} m")
+print(f"  Min ciclos: {MIN_CYCLES}")
+print(f"  T_REF    : {T_REF}")
+print("=" * 65)
+
+# ── Descobrir arquivos ATL06 ──────────────────────────────────
+atl06_files = sorted(ATL06_DIR.glob("ATL06_*.h5"))
+if not atl06_files:
+    atl06_files = sorted(ATL06_DIR.rglob("ATL06_*.h5"))
+
+print(f"\nArquivos ATL06 encontrados: {len(atl06_files)}")
+if not atl06_files:
+    raise SystemExit(f"✗ Nenhum arquivo ATL06 encontrado em {ATL06_DIR}")
+
+# ── Estrutura de acumulação: {(rgt, beam): {cycle: dados}} ────
+from collections import defaultdict
+rgt_data = defaultdict(lambda: defaultdict(list))
+# rgt_data[(rgt, beam)][cycle] = lista de dicts com pontos
+
+print("\nLendo arquivos ATL06...")
+for fpath in tqdm(atl06_files, desc="Arquivos"):
+    for beam in BEAMS:
+        seg = read_atl06_beam(fpath, beam)
+        if seg is None:
+            continue
+        seg = filter_bbox(seg)
+        if seg is None:
+            continue
+        seg = project_to_stereo(seg)
+        key = (seg["rgt"], beam)
+        rgt_data[key][seg["cycle"]].append(seg)
+
+print(f"\n  Combinações (RGT, beam) com dados: {len(rgt_data)}")
+
+# ── Processar cada (RGT, beam) ────────────────────────────────
+all_results = []
+total_figs  = 0
+
+for (rgt, beam), cycles_dict in tqdm(rgt_data.items(),
+                                      desc="RGT/Beam"):
+
+    # Ordenar ciclos
+    cycles_sorted = sorted(cycles_dict.keys())
+    n_cycles      = len(cycles_sorted)
+
+    if n_cycles < MIN_CYCLES:
+        continue
+
+    # ── Concatenar todos os ciclos numa estrutura única ───────
+    # Para cada ciclo: array de pontos ordenados ao longo da trilha
+    cycle_arrays = {}
+    for cyc in cycles_sorted:
+        segs = cycles_dict[cyc]
+        # Juntar segmentos do mesmo ciclo
+        x_c = np.concatenate([s["x"] for s in segs])
+        y_c = np.concatenate([s["y"] for s in segs])
+        h_c = np.concatenate([s["h"] for s in segs])
+        s_c = np.concatenate([s["s"] for s in segs])
+        t_c = np.concatenate([s["t"] for s in segs])
+
+        # Ordenar ao longo da trilha (por latitude, sentido do satélite)
+        lat_c = np.concatenate([s["lat"] for s in segs])
+        order = np.argsort(lat_c)
+        x_c, y_c, h_c, s_c, t_c = (x_c[order], y_c[order],
+                                      h_c[order], s_c[order], t_c[order])
+
+        # Distância ao longo da trilha
+        dist_c = along_track_distance(x_c, y_c)
+        bins_c = bin_along_track(dist_c, BIN_SIZE)
+
+        cycle_arrays[cyc] = {
+            "x": x_c, "y": y_c, "h": h_c, "s": s_c,
+            "t": t_c, "dist": dist_c, "bins": bins_c,
+        }
+
+    # ── Descobrir todos os bins presentes ────────────────────
+    all_bins = set()
+    for cyc, arr in cycle_arrays.items():
+        all_bins.update(arr["bins"].tolist())
+    all_bins = np.array(sorted(all_bins))
+
+    # Tempo esperado de cada ciclo (mediana dos tempos do ciclo)
+    t_per_cycle = {
+        cyc: float(np.median(arr["t"]))
+        for cyc, arr in cycle_arrays.items()
+    }
+    t_cycle_vec = np.array([t_per_cycle[c] for c in cycles_sorted])
+
+    # ── Pasta de saída para este RGT/beam ────────────────────
+    fig_rgt_dir = FIG_DIR / f"rgt{rgt:04d}_{beam}"
+    fig_rgt_dir.mkdir(parents=True, exist_ok=True)
+
+    n_figs_this_rgt = 0
+
+    # ── Loop sobre bins ──────────────────────────────────────
+    for bin_id in all_bins:
+
+        # Coletar uma observação por ciclo neste bin
+        t_obs_list = []
+        h_obs_list = []
+        s_obs_list = []
+        x0_list    = []
+        y0_list    = []
+
+        for cyc in cycles_sorted:
+            arr  = cycle_arrays[cyc]
+            mask = arr["bins"] == bin_id
+            if mask.sum() == 0:
+                continue
+            # Mediana do bin neste ciclo
+            t_obs_list.append(float(np.median(arr["t"][mask])))
+            h_obs_list.append(float(np.median(arr["h"][mask])))
+            s_obs_list.append(float(np.median(arr["s"][mask])))
+            x0_list.append(float(np.median(arr["x"][mask])))
+            y0_list.append(float(np.median(arr["y"][mask])))
+
+        if len(t_obs_list) < MIN_CYCLES:
+            continue
+
+        t_obs = np.array(t_obs_list)
+        h_obs = np.array(h_obs_list)
+        s_obs = np.array(s_obs_list)
+        x0    = float(np.mean(x0_list))
+        y0    = float(np.mean(y0_list))
+        lon0, lat0 = to_lonlat.transform(x0, y0)
+
+        # ── Interpolação de ciclos faltantes ─────────────────
+        h_interp = interpolate_missing_cycles(t_obs, h_obs, t_cycle_vec)
+
+        # ── Ajuste da série temporal ──────────────────────────
+        fit = fit_timeseries(t_obs, h_obs, s=s_obs)
+        if fit is None:
+            continue
+
+        # ── Salvar resultado ──────────────────────────────────
+        all_results.append({
+            "rgt":     rgt,
+            "beam":    beam,
+            "bin_id":  bin_id,
+            "lat":     lat0,
+            "lon":     lon0,
+            "x":       x0,
+            "y":       y0,
+            "p0":      fit["p0"],
+            "p1":      fit["p1"],
+            "p2":      fit["p2"],
+            "p0_err":  fit["p0_err"],
+            "p1_err":  fit["p1_err"],
+            "p2_err":  fit["p2_err"],
+            "rmse":    fit["rmse"],
+            "nobs":    fit["nobs"],
+            "n_interp": int(np.sum(~np.isin(
+                t_cycle_vec.round(4), t_obs.round(4)
+            ) & ~np.isnan(h_interp))),
+        })
+
+        # ── Plot ─────────────────────────────────────────────
+        if (MAX_FIGS_PER_RGT is None or
+                n_figs_this_rgt < MAX_FIGS_PER_RGT):
+
+            out_fig = (fig_rgt_dir /
+                       f"ts_rgt{rgt:04d}_{beam}_bin{bin_id:.0f}.png")
+            try:
+                plot_timeseries(
+                    bin_id=bin_id, rgt=rgt, beam=beam,
+                    lat0=lat0, lon0=lon0,
+                    t_obs=t_obs, h_obs=h_obs,
+                    t_all=t_cycle_vec, h_interp=h_interp,
+                    fit=fit, out_path=out_fig
+                )
+                n_figs_this_rgt += 1
+                total_figs      += 1
+            except Exception as e:
+                print(f"  ⚠ Erro ao plotar bin {bin_id}: {e}")
+
+    gc.collect()
+
+# ============================================================
+# SALVAR RESULTADOS EM HDF5
+# ============================================================
+print(f"\nSalvando resultados...")
+
+if all_results:
+    out_h5 = RES_DIR / "rgt_timeseries.h5"
+
+    fields_float = ["lat", "lon", "x", "y",
+                    "p0", "p1", "p2",
+                    "p0_err", "p1_err", "p2_err",
+                    "rmse", "bin_id"]
+    fields_int   = ["rgt", "nobs", "n_interp"]
+    fields_str   = ["beam"]
+
+    with h5py.File(out_h5, "w") as fo:
+        for field in fields_float:
+            arr = np.array([r[field] for r in all_results], dtype=np.float64)
+            fo.create_dataset(field, data=arr,
+                              compression="gzip", compression_opts=4)
+
+        for field in fields_int:
+            arr = np.array([r[field] for r in all_results], dtype=np.int32)
+            fo.create_dataset(field, data=arr,
+                              compression="gzip", compression_opts=4)
+
+        beams_arr = np.array([r["beam"] for r in all_results],
+                             dtype=h5py.special_dtype(vlen=str))
+        fo.create_dataset("beam", data=beams_arr)
+
+        fo.attrs["n_bins"]    = len(all_results)
+        fo.attrs["t_ref"]     = T_REF
+        fo.attrs["bin_size"]  = BIN_SIZE
+        fo.attrs["lon_min"]   = LON_MIN
+        fo.attrs["lon_max"]   = LON_MAX
+        fo.attrs["lat_min"]   = LAT_MIN
+        fo.attrs["lat_max"]   = LAT_MAX
+
+    print(f"  ✓ {out_h5}")
+
+# ============================================================
+# MAPA RESUMO — dh/dt ao longo das trilhas
+# ============================================================
+print("\nGerando mapa resumo...")
+
+if all_results:
+    lats  = np.array([r["lat"]  for r in all_results])
+    lons  = np.array([r["lon"]  for r in all_results])
+    p1s   = np.array([r["p1"]   for r in all_results])
+    p1ers = np.array([r["p1_err"] for r in all_results])
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+    # ── Painel esquerdo: mapa de dh/dt ───────────────────────
+    ax = axes[0]
+    norm = TwoSlopeNorm(vmin=-3, vcenter=0, vmax=1.5)
+    sc   = ax.scatter(lons, lats, c=p1s, cmap="RdBu_r", norm=norm,
+                      s=4, alpha=0.8, rasterized=True)
+    cbar = plt.colorbar(sc, ax=ax, shrink=0.85, extend="both")
+    cbar.set_label("dh/dt (m/ano)", fontsize=11)
+    ax.set_xlabel("Longitude (°)", fontsize=11)
+    ax.set_ylabel("Latitude (°)",  fontsize=11)
+    ax.set_title("Taxa de Mudança de Elevação\nao longo dos RGTs",
+                 fontsize=12, fontweight="bold")
+    ax.set_aspect(1 / np.cos(np.radians(np.nanmean(lats))))
+    ax.grid(True, alpha=0.3, linestyle="--")
+
+    # Estatísticas no mapa
+    info = (f"n = {len(p1s):,} bins\n"
+            f"Média = {np.nanmean(p1s):+.3f} m/ano\n"
+            f"Mediana = {np.nanmedian(p1s):+.3f} m/ano\n"
+            f"Std = {np.nanstd(p1s):.3f} m/ano")
+    ax.text(0.02, 0.97, info, transform=ax.transAxes,
+            fontsize=9, va="top",
+            bbox=dict(boxstyle="round", facecolor="white",
+                      edgecolor="#AAAAAA", alpha=0.9))
+
+    # ── Painel direito: histograma de dh/dt ──────────────────
+    ax2 = axes[1]
+    bins_hist = np.arange(-4, 2.5, 0.1)
+    ax2.hist(p1s[np.isfinite(p1s)], bins=bins_hist,
+             density=True, color="#CC2A2A", alpha=0.8, edgecolor="none")
+    ax2.axvline(0, color="black", lw=1.5, ls="--", alpha=0.6)
+    ax2.axvline(np.nanmean(p1s),   color="#1565C0", lw=2.0,
+                label=f"Média {np.nanmean(p1s):+.3f} m/ano")
+    ax2.axvline(np.nanmedian(p1s), color="#1565C0", lw=1.5, ls=":",
+                label=f"Mediana {np.nanmedian(p1s):+.3f} m/ano")
+    ax2.set_xlabel("dh/dt (m/ano)", fontsize=11)
+    ax2.set_ylabel("Densidade",     fontsize=11)
+    ax2.set_title("Distribuição de dh/dt\n(todos os bins e RGTs)",
+                  fontsize=12, fontweight="bold")
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+
+    pct_neg = 100 * np.sum(p1s < 0) / len(p1s)
+    ax2.text(0.02, 0.97,
+             f"Afinamento : {pct_neg:.0f}%\n"
+             f"Espessamento: {100-pct_neg:.0f}%",
+             transform=ax2.transAxes, fontsize=10, va="top",
+             bbox=dict(boxstyle="round", facecolor="white",
+                       edgecolor="#AAAAAA", alpha=0.9))
+
+    fig.suptitle(
+        "ICESat-2 ATL06 — Análise Temporal por RGT\n"
+        "Amundsen Sea Embayment | Inverno Austral (JJA) 2019–2025",
+        fontsize=13, fontweight="bold"
+    )
+    plt.tight_layout()
+
+    map_out = OUT_DIR / "mapa_resumo_rgt_dhdt.png"
+    plt.savefig(map_out, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  ✓ {map_out.name}")
+
+# ============================================================
+# RESUMO FINAL
+# ============================================================
+print("\n" + "=" * 65)
+print("RESUMO FINAL")
+print("=" * 65)
+print(f"  Bins válidos    : {len(all_results):,}")
+print(f"  Figuras geradas : {total_figs:,}")
+if all_results:
+    p1_all = np.array([r["p1"] for r in all_results])
+    print(f"  dh/dt médio     : {np.nanmean(p1_all):+.4f} m/ano")
+    print(f"  dh/dt mediana   : {np.nanmedian(p1_all):+.4f} m/ano")
+    print(f"  dh/dt std       : {np.nanstd(p1_all):.4f} m/ano")
+print(f"\n  Resultados em   : {OUT_DIR}")
+print(f"  Figuras em      : {FIG_DIR}")
+print("=" * 65)
+print("\nPróximo passo: use rgt_timeseries.h5 para análise espacial.")
